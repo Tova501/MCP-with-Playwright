@@ -32,12 +32,8 @@ FORECAST_URL = "https://www.weather2day.co.il/forecast"
 
 # --- Tune these if the site's markup differs from the recorded selectors here ---------
 # This uses the Playwright selector engines recorded by codegen.
-SEARCH_INPUT_SELECTOR = (
-    "role=searchbox[name=\"מזג האוויר ב\"]"
-)
-DROPDOWN_ITEM_SELECTOR = (
-    "text=\"חוף הילטון, תל אביב\""
-)
+SEARCH_INPUT_SELECTOR = "id=city_search_forecast"
+DROPDOWN_ITEM_SELECTOR = "#city_search_forecastautocomplete-list div"
 FORECAST_CONTENT_SELECTOR = "main, #forecast, .forecast-content, article, body"
 # --------------------------------------------------------------------------------
 

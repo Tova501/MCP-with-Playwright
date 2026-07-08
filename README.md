@@ -49,7 +49,7 @@ which of these 4 tools to call and in what order.
    ```bash
    uv run playwright install chromium
    ```
-3. Copy `.env.example` to `.env` and fill in your `ANTHROPIC_API_KEY`.
+3. Copy `.env.example` to `.env` and fill in your `GOOGLE_API_KEY`.
 4. Run the chat host:
    ```bash
    uv run host.py

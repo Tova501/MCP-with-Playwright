@@ -1,15 +1,16 @@
 import asyncio
+import json
+import traceback
 from contextlib import AsyncExitStack
 from typing import Any
 
-import httpx
+from google import genai
+from google.genai import types
 
-from anthropic import Anthropic
 from client import MCPClient
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 class ChatHost:
     def __init__(self):
@@ -20,10 +21,10 @@ class ChatHost:
         self.tool_clients: dict[str, tuple[MCPClient, str]] = {}
         self.clients_connected = False
         self.exit_stack = AsyncExitStack()
-        # self.anthropic = Anthropic()
-        # For Netfree
-        transport = httpx.HTTPTransport(verify=False)
-        self.anthropic = Anthropic(http_client=httpx.Client(transport=transport))
+        self.genai_client = genai.Client()
+        self.genai_chat = self.genai_client.aio.chats.create(
+            model="gemini-2.5-flash"
+        )
 
     async def connect_mcp_clients(self):
         """Connect all configured MCP clients once."""
@@ -75,67 +76,146 @@ class ChatHost:
         return available_tools
 
 
+    def _build_tool_definitions(self, available_tools: list[dict[str, Any]]) -> list[types.Tool]:
+        return [
+            types.Tool(
+                function_declarations=[
+                    types.FunctionDeclaration(
+                        name=tool["name"],
+                        description=tool.get("description", "MCP tool"),
+                        parameters=tool.get("input_schema", {"type": "object"}),
+                    )
+                ]
+            )
+            for tool in available_tools
+        ]
+
+
+    def _extract_response_text(self, response: Any) -> str:
+        if hasattr(response, "text") and response.text:
+            return response.text
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return ""
+
+        content = getattr(candidates[0], "content", None)
+        if content is None:
+            return ""
+
+        if hasattr(content, "text") and content.text:
+            return content.text
+
+        texts = []
+        for part in getattr(content, "parts", []) or []:
+            if hasattr(part, "text") and part.text:
+                texts.append(part.text)
+            elif hasattr(part, "plain_text") and part.plain_text:
+                texts.append(part.plain_text)
+
+        return "".join(texts).strip()
+
+
+    def _extract_tool_call(self, response: Any) -> Any:
+        function_calls = getattr(response, "function_calls", None) or []
+        if function_calls:
+            return function_calls[0]
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return None
+
+        content = getattr(candidates[0], "content", None)
+        if content is None:
+            return None
+
+        for part in getattr(content, "parts", []) or []:
+            tool_call = getattr(part, "function_call", None)
+            if tool_call is not None:
+                return tool_call
+
+        return None
+
+
+    def _normalize_tool_args(self, args: Any) -> dict[str, Any]:
+        if args is None:
+            return {}
+        if isinstance(args, str):
+            try:
+                return json.loads(args)
+            except json.JSONDecodeError:
+                return {"raw": args}
+        if isinstance(args, dict):
+            return args
+        return {"raw": args}
+
+
+    def _normalize_tool_result(self, result: Any) -> str:
+        if result is None:
+            return ""
+
+        content = getattr(result, "content", result)
+        if isinstance(content, str):
+            return content
+        if hasattr(content, "text") and content.text:
+            return content.text
+
+        if hasattr(content, "parts"):
+            parts = []
+            for part in getattr(content, "parts") or []:
+                part_text = getattr(part, "text", None) or getattr(part, "plain_text", None)
+                if part_text:
+                    parts.append(part_text)
+            if parts:
+                return "".join(parts)
+
+        return repr(content)
+
+
+    async def _generate_model_response(
+        self, query: str, tool_definitions: list[types.Tool]
+    ) -> Any:
+        return await self.genai_chat.send_message(
+            query,
+            config={
+                "tools": tool_definitions,
+                "tool_config": {"function_calling_config": {"mode": "auto"}},
+                "max_output_tokens": 1000,
+            },
+        )
+
+
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
-        messages = [{"role": "user", "content": query}]
+        """Process a query using Gemini and available tools."""
         available_tools = await self.get_available_tools()
+        tool_definitions = self._build_tool_definitions(available_tools)
         final_text = []
+        prompt = query
 
         while True:
-            response = self.anthropic.messages.create(
-                model="claude-haiku-4-5",
-                max_tokens=1000,
-                messages=messages,
-                tools=available_tools
-            )
+            response = await self._generate_model_response(prompt, tool_definitions)
+            tool_call = self._extract_tool_call(response)
+            assistant_text = self._extract_response_text(response)
+            if assistant_text:
+                final_text.append(assistant_text)
 
-            assistant_message_content = []
-            tool_results = []
-            saw_tool_use = False
-
-            for content in response.content:
-                assistant_message_content.append(content)
-
-                if content.type == 'text':
-                    final_text.append(content.text)
-                    continue
-
-                if content.type != 'tool_use':
-                    continue
-
-                saw_tool_use = True
-                tool_name = content.name
-                tool_args = content.input
-
-                if tool_name not in self.tool_clients:
-                    raise RuntimeError(f"Unknown tool requested by model: {tool_name}")
-
-                client, original_tool_name = self.tool_clients[tool_name]
-                if client.session is None:
-                    raise RuntimeError(f"MCP client {client.client_name} is not connected")
-
-                result = await client.session.call_tool(original_tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": content.id,
-                        "content": result.content,
-                    }
-                )
-
-            messages.append({
-                "role": "assistant",
-                "content": assistant_message_content
-            })
-
-            if not saw_tool_use:
+            if tool_call is None:
                 break
 
-            messages.append({
-                "role": "user",
-                "content": tool_results
-            })
+            tool_name = getattr(tool_call, "name", None)
+            tool_args = self._normalize_tool_args(getattr(tool_call, "args", None))
+
+            if tool_name not in self.tool_clients:
+                raise RuntimeError(f"Unknown tool requested by model: {tool_name}")
+
+            client, original_tool_name = self.tool_clients[tool_name]
+            if client.session is None:
+                raise RuntimeError(f"MCP client {client.client_name} is not connected")
+
+            result = await client.session.call_tool(original_tool_name, tool_args)
+            tool_result_text = self._normalize_tool_result(result)
+            final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+            prompt = f"Tool {tool_name} returned: {tool_result_text}"
 
         return "\n".join(final_text)
     
@@ -155,8 +235,9 @@ class ChatHost:
                 print("\n" + response)
                 
             except Exception as e:
-                print(f"\nchat_loop Error: {str(e)}")
-                
+                print(f"\nchat_loop Error: {type(e).__name__}: {repr(e)}")
+                traceback.print_exc()
+
     async def cleanup(self):
         """Clean up resources"""
         for client in reversed(self.mcp_clients):
