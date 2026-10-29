@@ -2,6 +2,7 @@ import asyncio
 import json
 import traceback
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 from google import genai
@@ -12,11 +13,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Server scripts live next to this file, so the host works from any directory.
+SRC_DIR = Path(__file__).parent
+
+# Stop a confused model from calling tools forever.
+MAX_TOOL_ROUNDS = 10
+MAX_OUTPUT_TOKENS = 4000
+
+SYSTEM_INSTRUCTION = """You are a weather assistant with browser tools.
+- For a city in the USA, use the weather_USA tools.
+- For a city in Israel, use the weather_Israel tools in this order:
+  open_weather_forecast_israel -> enter_weather_forecast_city_israel (prefer the
+  Hebrew city name) -> select_weather_forecast_city_israel ->
+  get_weather_forecast_content_israel. Then answer from that page content only,
+  and finally call close_weather_forecast_israel.
+- If a tool reports a problem, adjust (e.g. try another spelling) instead of guessing.
+- Answer in the same language the user wrote in, short and clear."""
+
 class ChatHost:
     def __init__(self):
         self.mcp_clients: list[MCPClient] = [
-            MCPClient("./weather_USA.py"),
-            MCPClient("./weather_Israel.py"),
+            MCPClient(str(SRC_DIR / "weather_USA.py")),
+            MCPClient(str(SRC_DIR / "weather_Israel.py")),
         ]
         self.tool_clients: dict[str, tuple[MCPClient, str]] = {}
         self.clients_connected = False
@@ -116,25 +134,25 @@ class ChatHost:
         return "".join(texts).strip()
 
 
-    def _extract_tool_call(self, response: Any) -> Any:
+    def _extract_tool_calls(self, response: Any) -> list[Any]:
+        """Return every function call in the response (Gemini may ask for several)."""
         function_calls = getattr(response, "function_calls", None) or []
         if function_calls:
-            return function_calls[0]
+            return list(function_calls)
 
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
-            return None
+            return []
 
         content = getattr(candidates[0], "content", None)
         if content is None:
-            return None
+            return []
 
-        for part in getattr(content, "parts", []) or []:
-            tool_call = getattr(part, "function_call", None)
-            if tool_call is not None:
-                return tool_call
-
-        return None
+        return [
+            part.function_call
+            for part in getattr(content, "parts", []) or []
+            if getattr(part, "function_call", None) is not None
+        ]
 
 
     def _normalize_tool_args(self, args: Any) -> dict[str, Any]:
@@ -173,15 +191,37 @@ class ChatHost:
 
 
     async def _generate_model_response(
-        self, query: str, tool_definitions: list[types.Tool]
+        self, message: str | list[types.Part], tool_definitions: list[types.Tool]
     ) -> Any:
         return await self.genai_chat.send_message(
-            query,
+            message,
             config={
+                "system_instruction": SYSTEM_INSTRUCTION,
                 "tools": tool_definitions,
                 "tool_config": {"function_calling_config": {"mode": "auto"}},
-                "max_output_tokens": 1000,
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
             },
+        )
+
+
+    async def _call_tool(self, tool_call: Any) -> types.Part:
+        """Run one tool call on its MCP server and wrap the result as a
+        function response, the format Gemini expects for tool results."""
+        tool_name = getattr(tool_call, "name", None)
+        tool_args = self._normalize_tool_args(getattr(tool_call, "args", None))
+        print(f"[Calling tool {tool_name} with args {tool_args}]")
+
+        if tool_name not in self.tool_clients:
+            result_text = f"Error: unknown tool {tool_name}"
+        else:
+            client, original_tool_name = self.tool_clients[tool_name]
+            if client.session is None:
+                raise RuntimeError(f"MCP client {client.client_name} is not connected")
+            result = await client.session.call_tool(original_tool_name, tool_args)
+            result_text = self._normalize_tool_result(result)
+
+        return types.Part.from_function_response(
+            name=tool_name, response={"result": result_text}
         )
 
 
@@ -190,32 +230,21 @@ class ChatHost:
         available_tools = await self.get_available_tools()
         tool_definitions = self._build_tool_definitions(available_tools)
         final_text = []
-        prompt = query
+        message: str | list[types.Part] = query
 
-        while True:
-            response = await self._generate_model_response(prompt, tool_definitions)
-            tool_call = self._extract_tool_call(response)
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await self._generate_model_response(message, tool_definitions)
             assistant_text = self._extract_response_text(response)
             if assistant_text:
                 final_text.append(assistant_text)
 
-            if tool_call is None:
+            tool_calls = self._extract_tool_calls(response)
+            if not tool_calls:
                 break
 
-            tool_name = getattr(tool_call, "name", None)
-            tool_args = self._normalize_tool_args(getattr(tool_call, "args", None))
-
-            if tool_name not in self.tool_clients:
-                raise RuntimeError(f"Unknown tool requested by model: {tool_name}")
-
-            client, original_tool_name = self.tool_clients[tool_name]
-            if client.session is None:
-                raise RuntimeError(f"MCP client {client.client_name} is not connected")
-
-            result = await client.session.call_tool(original_tool_name, tool_args)
-            tool_result_text = self._normalize_tool_result(result)
-            final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-            prompt = f"Tool {tool_name} returned: {tool_result_text}"
+            message = [await self._call_tool(tool_call) for tool_call in tool_calls]
+        else:
+            final_text.append(f"[Stopped after {MAX_TOOL_ROUNDS} tool rounds]")
 
         return "\n".join(final_text)
     

@@ -1,0 +1,34 @@
+<!doctype html>
+<!-- Minimal offline copy of weather2day's search page: same input id and
+     the same "<input id>autocomplete-list" dropdown the real site renders. -->
+<html lang="he" dir="rtl">
+<head><meta charset="utf-8"><title>search</title></head>
+<body>
+<nav>תפריט ראשי</nav>
+<form autocomplete="off">
+  <input id="city_search_forecast" type="text">
+</form>
+<script>
+  const cities = ["חיפה", "חיפה - נווה שאנן", "תל אביב - יפו", "ירושלים"];
+  const input = document.getElementById("city_search_forecast");
+
+  input.addEventListener("input", () => {
+    document.getElementById(input.id + "autocomplete-list")?.remove();
+    const matches = cities.filter(c => input.value && c.includes(input.value));
+    if (!matches.length) return;
+
+    const list = document.createElement("div");
+    list.id = input.id + "autocomplete-list";
+    for (const city of matches) {
+      const item = document.createElement("div");
+      item.textContent = city;
+      item.addEventListener("click", () => {
+        location.href = "forecast.html?city=" + encodeURIComponent(city);
+      });
+      list.appendChild(item);
+    }
+    input.parentNode.appendChild(list);
+  });
+</script>
+</body>
+</html>
